@@ -1,0 +1,26 @@
+{
+  "name": "E2E Wallet",
+  "description": "Automation-first injected wallet backed by a shared local signer.",
+  "version": "1.0.0",
+  "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwscQZ12aawVrMm22HMWZ4BqCwJ55ei4/ereRSSIi7GJxr5Zb6sLbAiZW09a/IUXOd2PH6ooQQbceTyxG7IiVGsEVbOlTeQ62H+kjhNV3bx62d/BJKm+UnMGszR+FS4xrNGVYp3ktyfemkANmv14V9ViAney47Prqs1hDciSk9YgtSFpyx2adoKb3uZHsn81aNAtJPO5j1H8hKCBPqSxPPPIid/H4hfueHDnnkqgYiOQiIa4UdKfD3R9/a/EMpl/NinKAEKjbuzicLUYejCnSbxa5wleRpDmW8TYOCFJt0eZP6Mijg/zixAhPSqDpDSmdymEZ3fRBsQYyubWnVdL3MQIDAQAB",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1:8547/*"],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["bridge.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["inpage.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
