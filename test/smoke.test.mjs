@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -11,7 +11,7 @@ import {
   recoverTypedDataAddress,
 } from 'viem';
 import { createCoordinator, EXTENSION_ORIGIN } from '../src/coordinator.mjs';
-import { privateKeyToAccount } from 'viem/accounts';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
 
 async function listen(server) {
@@ -191,4 +191,104 @@ test('injected-wallet backend signs and serializes concurrent transactions', asy
     if (previousKeys === undefined) delete process.env.E2E_KEYS;
     else process.env.E2E_KEYS = previousKeys;
   }
+});
+
+async function withCoordinator(keys, run) {
+  const stateDir = await mkdtemp(join(tmpdir(), 'e2e-wallet-'));
+  const previousKeys = process.env.E2E_KEYS;
+  let coordinator;
+  try {
+    process.env.E2E_KEYS = JSON.stringify(keys);
+    coordinator = await createCoordinator({ stateDir });
+    const { port } = await coordinator.listen(0);
+    await run({ port, stateDir });
+  } finally {
+    await coordinator?.close();
+    await rm(stateDir, { recursive: true, force: true });
+    if (previousKeys === undefined) delete process.env.E2E_KEYS;
+    else process.env.E2E_KEYS = previousKeys;
+  }
+}
+
+const control = (port, command, params) => walletRequest(port, { kind: 'control', command, params });
+const importWallet = (port, name, privateKey) => fetch(`http://127.0.0.1:${port}/wallets`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ name, privateKey }),
+}).then((response) => response.json());
+
+test('positions resolve and listWallets reports configured and stored wallets', async () => {
+  const keys = [generatePrivateKey(), generatePrivateKey(), generatePrivateKey()];
+  const addresses = keys.map((key) => privateKeyToAccount(key).address);
+  const lower = addresses.map((address) => address.toLowerCase());
+
+  await withCoordinator(keys, async ({ port, stateDir }) => {
+    for (const [wallet, address] of [
+      [0, addresses[0]],
+      ['0', addresses[0]],
+      ['default', addresses[0]],
+      [lower[0], addresses[0]],
+      [1, addresses[1]],
+      [addresses[1], addresses[1]],
+      ['2', addresses[2]],
+    ]) {
+      assert.equal((await control(port, 'changeWallet', { wallet })).result.address, address);
+    }
+    assert.equal((await control(port, 'getState')).result.wallet, '2');
+
+    const stored = (await control(port, 'changeWallet', { wallet: 'stored-one' })).result.address;
+    // A stray all-digit file must not shadow or imitate a position.
+    await writeFile(join(stateDir, 'wallets', '1'), `${generatePrivateKey()}\n`);
+    await writeFile(join(stateDir, 'wallets', '7'), `${generatePrivateKey()}\n`);
+    await control(port, 'setState', { connected: false, authorized: false });
+    const filesBefore = (await readdir(join(stateDir, 'wallets'))).sort();
+    assert.deepEqual(filesBefore, ['1', '7', 'stored-one']);
+
+    const listed = (await control(port, 'listWallets')).result;
+    assert.deepEqual(listed, [
+      { wallet: '0', address: addresses[0], source: 'configured', aliases: ['default', lower[0]], index: 0 },
+      { wallet: '1', address: addresses[1], source: 'configured', aliases: [lower[1]], index: 1 },
+      { wallet: '2', address: addresses[2], source: 'configured', aliases: [lower[2]], index: 2 },
+      { wallet: 'stored-one', address: stored, source: 'stored', aliases: [] },
+    ]);
+    assert.ok(!JSON.stringify(listed).includes('privateKey'));
+    for (const key of keys) assert.ok(!JSON.stringify(listed).includes(key.slice(2)));
+    assert.equal((await control(port, 'changeWallet', { wallet: 1 })).result.address, addresses[1]);
+    await control(port, 'changeWallet', { wallet: 'stored-one' });
+
+    await assert.rejects(
+      control(port, 'changeWallet', { wallet: 'typo', create: false }),
+      { code: -32602, message: 'Unknown wallet typo.' },
+    );
+    for (const wallet of [5, '5', '7', '01']) {
+      for (const create of [undefined, true, false]) {
+        await assert.rejects(
+          control(port, 'changeWallet', { wallet, create }),
+          { code: -32602, message: `Unknown wallet ${wallet}. E2E_KEYS has 3 keys.` },
+        );
+      }
+      await assert.rejects(control(port, 'setState', { wallet }), { code: -32602 });
+    }
+    for (const wallet of [-1, 1.5, null, {}]) {
+      await assert.rejects(control(port, 'changeWallet', { wallet }), { code: -32602 });
+    }
+    assert.equal((await control(port, 'getState')).result.wallet, 'stored-one');
+
+    for (const name of ['5', 5, '0']) {
+      assert.deepEqual((await importWallet(port, name, generatePrivateKey())).error, {
+        code: -32602,
+        message: `Wallet name ${name} is reserved: all-digit names are positions in E2E_KEYS.`,
+      });
+    }
+    assert.deepEqual((await readdir(join(stateDir, 'wallets'))).sort(), filesBefore);
+  });
+});
+
+test('a single key reports the singular in the position error', async () => {
+  await withCoordinator([generatePrivateKey()], async ({ port }) => {
+    await assert.rejects(
+      control(port, 'changeWallet', { wallet: 1 }),
+      { code: -32602, message: 'Unknown wallet 1. E2E_KEYS has 1 key.' },
+    );
+  });
 });

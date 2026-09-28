@@ -108,7 +108,8 @@
   const control = Object.freeze({
     getState: () => bridge({ kind: 'control', command: 'getState' }),
     set: (patch) => bridge({ kind: 'control', command: 'setState', params: patch }),
-    changeWallet: (wallet) => bridge({ kind: 'control', command: 'changeWallet', params: { wallet } }),
+    listWallets: () => bridge({ kind: 'control', command: 'listWallets' }),
+    changeWallet: (wallet, options) => bridge({ kind: 'control', command: 'changeWallet', params: { ...options, wallet } }),
     changeChain: (chainId) => bridge({ kind: 'control', command: 'changeChain', params: { chainId } }),
     connect: () => bridge({ kind: 'control', command: 'connect' }),
     disconnect: () => bridge({ kind: 'control', command: 'disconnect' }),

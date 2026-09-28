@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -68,7 +68,10 @@ class RpcResponseError extends Error {
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const hexChainId = (chainId) => `0x${chainId.toString(16)}`;
 const quantity = (value) => value === undefined || value === null ? undefined : BigInt(value);
-const normalizeWalletName = (name) => {
+const isPosition = (name) => /^\d+$/.test(name);
+const normalizeWalletName = (rawName) => {
+  // Positions in E2E_KEYS may arrive as numbers: changeWallet(1).
+  const name = Number.isSafeInteger(rawName) && rawName >= 0 ? String(rawName) : rawName;
   if (typeof name !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
     throw new ProviderError(-32602, 'Wallet names may contain only letters, numbers, dot, underscore, and dash.');
   }
@@ -119,9 +122,11 @@ export class WalletService {
     this.stateDir = stateDir;
     this.walletDir = join(stateDir, 'wallets');
     this.accounts = new Map();
-    privateKeys.map(privateKeyToAccount).forEach((account, index) => {
-      this.accounts.set(account.address.toLowerCase(), account);
-      if (index === 0) this.accounts.set('default', account);
+    this.configured = privateKeys.map(privateKeyToAccount).map((account, index) => {
+      const wallet = String(index);
+      const aliases = [...(index === 0 ? ['default'] : []), account.address.toLowerCase()];
+      for (const name of [wallet, ...aliases]) this.accounts.set(name, account);
+      return { wallet, address: account.address, source: 'configured', aliases, index };
     });
     this.chains = new Map(chains.map((chain) => [chain.id, chain]));
     this.clients = new Map();
@@ -158,10 +163,15 @@ export class WalletService {
     this.database.close();
   }
 
-  async ensureWallet(rawName) {
+  async ensureWallet(rawName, { create = true } = {}) {
     const name = normalizeWalletName(rawName);
     const configuredAccount = this.accounts.get(name) || this.accounts.get(name.toLowerCase());
     if (configuredAccount) return configuredAccount;
+    // All-digit names are positions in E2E_KEYS: never read, created or imported as stored wallets.
+    if (isPosition(name)) {
+      const count = this.configured.length;
+      throw new ProviderError(-32602, `Unknown wallet ${name}. E2E_KEYS has ${count} key${count === 1 ? '' : 's'}.`);
+    }
 
     const path = join(this.walletDir, name);
     let privateKey;
@@ -169,6 +179,7 @@ export class WalletService {
       privateKey = (await readFile(path, 'utf8')).trim();
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
+      if (!create) throw new ProviderError(-32602, `Unknown wallet ${name}.`);
       privateKey = generatePrivateKey();
       try {
         await writeFile(path, `${privateKey}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
@@ -184,6 +195,9 @@ export class WalletService {
   }
   async addWallet(rawName, rawPrivateKey) {
     const name = normalizeWalletName(rawName);
+    if (isPosition(name)) {
+      throw new ProviderError(-32602, `Wallet name ${name} is reserved: all-digit names are positions in E2E_KEYS.`);
+    }
     const privateKey = normalizePrivateKey(rawPrivateKey);
     const account = privateKeyToAccount(privateKey);
     const path = join(this.walletDir, name);
@@ -197,6 +211,22 @@ export class WalletService {
     return { wallet: name, address: account.address };
   }
 
+  async listWallets() {
+    const wallets = [...this.configured];
+    const configuredNames = new Set(wallets.flatMap(({ wallet, aliases }) => [wallet, ...aliases]));
+    for (const name of (await readdir(this.walletDir)).sort()) {
+      // Configured names win in ensureWallet, so a stored file with the same name is unreachable.
+      if (isPosition(name) || configuredNames.has(name) || configuredNames.has(name.toLowerCase())) continue;
+      try {
+        normalizeWalletName(name);
+        const privateKey = (await readFile(join(this.walletDir, name), 'utf8')).trim();
+        wallets.push({ wallet: name, address: privateKeyToAccount(privateKey).address, source: 'stored', aliases: [] });
+      } catch {
+        // Not a wallet file.
+      }
+    }
+    return wallets;
+  }
 
   context(contextId) {
     if (typeof contextId !== 'string' || contextId.length > 200) {
@@ -235,8 +265,9 @@ export class WalletService {
     const previous = await this.state(contextId);
 
     if (patch.wallet !== undefined) {
-      context.wallet = normalizeWalletName(patch.wallet);
-      await this.ensureWallet(context.wallet);
+      const wallet = normalizeWalletName(patch.wallet);
+      await this.ensureWallet(wallet); // may throw: keep the previous wallet then
+      context.wallet = wallet;
     }
     if (patch.chainId !== undefined) {
       context.chainId = Number(typeof patch.chainId === 'string' ? BigInt(patch.chainId) : patch.chainId);
@@ -269,7 +300,10 @@ export class WalletService {
         const changed = await this.setState(contextId, params);
         return { result: changed.state, events: changed.events };
       }
+      case 'listWallets':
+        return { result: await this.listWallets(), events: [] };
       case 'changeWallet': {
+        if (params.create === false) await this.ensureWallet(params.wallet, { create: false });
         const changed = await this.setState(contextId, { wallet: params.wallet });
         return { result: changed.state, events: changed.events };
       }
